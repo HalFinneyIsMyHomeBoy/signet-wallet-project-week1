@@ -1,0 +1,134 @@
+# Provided xprv
+xprv = "tprv8ZgxMBicQKsPeLXKfq3NUvnurBJTWsnp8MnJRt8PLqJqwH3xtdE2XTZunsNNLU8tmx3XPyTdCsy6nbMnYtxLkawcJa2DociVDF6EZ4gzpMj"
+
+# Decode the base58 xprv
+def base58_decode(base58_string: str) -> bytes:
+    base58_alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    num = 0
+    for char in base58_string:
+        num = num * 58 + base58_alphabet.index(char)
+
+    result = b""
+    while num > 0:
+        num, remainder = divmod(num, 256)
+        result = bytes([remainder]) + result
+
+    return result[:-4]
+
+# Deserialize the extended key bytes
+def deserialize_key(b: bytes) -> dict:
+    version = int.from_bytes(b[:4], byteorder='big')
+    depth = b[4]
+    fingerprint = int.from_bytes(b[5:9], byteorder='big')
+    index = int.from_bytes(b[9:13], byteorder='big')
+    chaincode = b[13:45]
+    key_data = b[45:]
+
+    return {
+        "version": version,
+        "depth": depth,
+        "fingerprint": fingerprint,
+        "index": index,
+        "chaincode": chaincode,
+        "key_data": key_data
+    }
+
+# Derive the key and chaincode at the specified path
+def derive_key_at_path(xprv: str, path: List[Tuple[int, bool]]) -> Tuple[bytes, bytes]:
+    decoded_xprv = base58_decode(xprv)
+    deserialized_key_data = deserialize_key(decoded_xprv)
+
+    key_data = deserialized_key_data["key_data"]
+    chaincode = deserialized_key_data["chaincode"]
+
+    derived_key_data = key_data
+    derived_chaincode = chaincode
+
+    for index, hardened in path:
+        derived = derive_priv_child(derived_key_data, derived_chaincode, index, hardened)
+        derived_key_data = derived["key"]
+        derived_chaincode = derived["chaincode"]
+
+    return derived_key_data, derived_chaincode
+
+# Perform a BIP32 parent private key -> child private key operation
+def derive_priv_child(key: bytes, chaincode: bytes, index: int, hardened: bool) -> dict:
+    data = b"\x00" + key + index.to_bytes(4, 'big') if not hardened else b"\x00" + key + index.to_bytes(4, 'big')
+    hmac_result = hmac.new(chaincode, data, hashlib.sha512).digest()
+    left_part = int.from_bytes(hmac_result[:32], 'big')
+    right_part = hmac_result[32:]
+    
+    new_key = (int.from_bytes(key, 'big') + left_part) % SECP256k1.order
+    new_key_bytes = new_key.to_bytes(32, 'big').rjust(32, b'\x00')
+    new_chaincode = right_part
+    
+    return {"key": new_key_bytes, "chaincode": new_chaincode}
+
+
+# Derive 2000 private keys from the path
+def get_wallet_privs(key: bytes, chaincode: bytes, path: List[Tuple[int, bool]]) -> List[bytes]:
+    privs = [key]
+    for index, hardened in path:
+        derived = derive_priv_child(privs[-1], chaincode, index, hardened)
+        privs.append(derived["key"])
+
+    return privs
+
+# Compute the compressed public key for each private key
+def get_pub_from_priv(priv: bytes) -> bytes:
+    signing_key = SigningKey.from_string(priv, curve=SECP256k1)
+    vk = signing_key.get_verifying_key()
+    return vk.to_string("compressed")
+
+
+# Compute the P2WPKH witness program for each compressed public key
+def get_p2wpkh_program(pubkey: bytes, version: int = 0) -> bytes:
+    return bytes([version]) + hashlib.new('ripemd160', hashlib.sha256(pubkey).digest()).digest()
+
+
+def bcli(cmd: str):
+    res = run(["bitcoin-cli", "-signet"] + cmd.split(" "), capture_output=True, encoding="utf-8")
+    if res.returncode == 0:
+        return res.stdout.strip()
+    else:
+        raise Exception(res.stderr.strip())
+
+# Look for you compressed public keys in all TX witnesses - these are coins you spent
+def blockscan(programs:bytes):
+    print(len(programs))    
+    for h in range(311):
+        hash=bcli(f"getblockhash {h}")
+        txs = json.loads(bcli(f"getblock {hash} 2"))["tx"]
+        i=0
+        for tx in txs:
+            
+            for i, prog in enumerate(programs):
+                if prog.hex()[2:] in [out["scriptPubKey"]["hex"] for out in tx["vout"]]:                    
+ 
+                    print("output MATCHEDDDD")
+
+
+
+
+
+
+
+path = [(0x84, True), (0x01, True), (0x00, True), (0x00, True)]  # 84h/1h/0h/0
+derived_key, derived_chaincode = derive_key_at_path(xprv, path)
+print(f"Derived Key: {derived_key.hex()}")
+print(f"Derived Chaincode: {derived_chaincode.hex()}")
+
+
+
+# Derive 2000 private keys from the path
+path_2000 = [(i, True) for i in range(1999)]
+privs = get_wallet_privs(derived_key, derived_chaincode, path_2000)
+
+# Compute the compressed public key for each private key
+pubs = [get_pub_from_priv(priv) for priv in privs]
+
+programs = [get_p2wpkh_program(pub) for pub in pubs]
+
+blockscan(programs)
+
+
